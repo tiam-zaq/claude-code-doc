@@ -355,6 +355,32 @@ jobs:
           } > /tmp/comment.md
           gh issue comment $ISSUE_NUMBER --body-file /tmp/comment.md
 
+      - name: PR本文を生成
+        run: |
+          REVIEW_BODY=$(cat /tmp/review_output.txt)
+          {
+            echo "## 概要"
+            echo ""
+            echo "Issue #${ISSUE_NUMBER} のAIマルチエージェント議論から自動生成されました。"
+            echo ""
+            echo "## エージェント構成"
+            echo ""
+            echo "- PM担当: 機能要求をPM視点で整理"
+            echo "- ヒアリング担当: 要件の整理・MoSCoW分類"
+            echo "- 段取り担当: タスク分解・依存関係の整理"
+            echo "- 設計/実装担当: 設計ドキュメント生成"
+            echo "- 見張り番担当: パイプライン品質監視"
+            echo "- レビュー担当: ベテラン視点での最終確認"
+            echo ""
+            echo "## レビュー担当の最終判定"
+            echo ""
+            echo "$REVIEW_BODY"
+            echo ""
+            echo "---"
+            echo ""
+            echo "Closes #${ISSUE_NUMBER}"
+          } > /tmp/pr_body.md
+
       - name: PRを作成
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -366,36 +392,8 @@ jobs:
           git add docs/
           git commit -m "docs: Issue #${ISSUE_NUMBER} のAIマルチエージェント議論からドキュメント生成"
           git push origin "$BRANCH"
-
-          REVIEW_BODY=$(cat /tmp/review_output.txt)
-
-          cat > /tmp/pr_body.md << PREOF
-## 概要
-
-Issue #${ISSUE_NUMBER} のAIマルチエージェント議論から自動生成されました。
-
-## エージェント構成
-
-| エージェント | 役割 |
-|------------|------|
-| 👔 PM担当 | 機能要求をPM視点で整理 |
-| 🎧 ヒアリング担当 | 要件の整理・MoSCoW分類 |
-| 📋 段取り担当 | タスク分解・依存関係の整理 |
-| 🏗️ 設計/実装担当 | 設計ドキュメント生成 |
-| 👁️ 見張り番担当 | パイプライン品質監視 |
-| ✅ レビュー担当 | ベテラン視点での最終確認 |
-
-## レビュー担当の最終判定
-
-${REVIEW_BODY}
-
----
-
-Closes #${ISSUE_NUMBER}
-PREOF
-
           gh pr create \
-            --title "📄 [AI生成] Issue #${ISSUE_NUMBER} の設計ドキュメント" \
+            --title "[AI生成] Issue #${ISSUE_NUMBER} の設計ドキュメント" \
             --body-file /tmp/pr_body.md \
             --head "$BRANCH" \
             --base main

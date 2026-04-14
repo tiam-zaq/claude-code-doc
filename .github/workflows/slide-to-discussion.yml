@@ -124,13 +124,12 @@ jobs:
           echo "✅ 議論Issueを作成しました: $NEW_ISSUE"
 
           # 元のIssueに作成したIssueのリンクをコメント
-          gh issue comment $ORIGINAL_ISSUE \
-            --body "$(cat << EOF
-## ✅ スライドの読み取りが完了しました
-
-議論を開始するIssueを作成しました 👇
-$NEW_ISSUE
-
-6つのAIエージェントが議論を開始します。進捗はそちらのIssueで確認できます。
-EOF
-            )"
+          {
+            echo "## スライドの読み取りが完了しました"
+            echo ""
+            echo "議論を開始するIssueを作成しました"
+            echo "$NEW_ISSUE"
+            echo ""
+            echo "6つのAIエージェントが議論を開始します。進捗はそちらのIssueで確認できます。"
+          } > /tmp/notify_body.md
+          gh issue comment $ORIGINAL_ISSUE --body-file /tmp/notify_body.md
