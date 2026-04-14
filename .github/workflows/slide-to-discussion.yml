@@ -54,7 +54,7 @@ jobs:
           ISSUE_BODY=$(gh issue view $ISSUE_NUMBER --json body --jq '.body')
 
           FILE=$(echo "$ISSUE_BODY" | grep -i '^file:' | head -1 | sed 's/^file:\s*//' | tr -d '[:space:]')
-          SLIDE=$(echo "$ISSUE_BODY" | grep -i '^slide:' | head -1 | sed 's/^slide:\s*//' | xargs)
+          SLIDE=$(echo "$ISSUE_BODY" | grep -i '^slide:' | head -1 | sed 's/^slide:\s*//' | tr -d ' ')
           COMMENT=$(echo "$ISSUE_BODY" | grep -i '^comment:' | head -1 | sed 's/^comment:\s*//')
 
           if [ -z "$FILE" ]; then
