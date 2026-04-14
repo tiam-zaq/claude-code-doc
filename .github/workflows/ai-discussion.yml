@@ -11,7 +11,7 @@ permissions:
 
 env:
   ISSUE_NUMBER: ${{ github.event.issue.number }}
-  MODEL: "claude-opus-4-5"
+  MODEL: "claude-sonnet-4-5-latest"
 
 # ============================================================
 # Stage 1: PM担当

@@ -15,7 +15,7 @@ import json
 import urllib.request
 import random
 
-MODEL = os.environ.get("MODEL", "claude-sonnet-4-5-20241022")
+MODEL = os.environ.get("MODEL", "claude-sonnet-4-5-latest")
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 DEFAULT_MAX_TURNS = 11
 

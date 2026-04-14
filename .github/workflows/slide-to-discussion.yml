@@ -11,7 +11,7 @@ permissions:
 
 env:
   ISSUE_NUMBER: ${{ github.event.issue.number }}
-  MODEL: "claude-sonnet-4-5-20241022"
+  MODEL: "claude-sonnet-4-5-latest"
 
 jobs:
   # ========== Stage 1: スライド抽出 ==========
