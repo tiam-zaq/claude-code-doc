@@ -1,0 +1,136 @@
+name: Slide to Discussion
+
+# ============================================================
+# slides/ フォルダのPPTXから議論テーマを取り出し、
+# 既存の ai-discussion.yml を呼び出すトリガーIssueを作成する。
+#
+# 使い方:
+#   1. slides/ フォルダにPPTXを置いてpush
+#   2. 以下の形式でIssueを作成して `slide-discuss` ラベルを付ける
+#
+#   file: slides/presentation.pptx
+#   slide: 3
+#   comment: （任意）追加で議論してほしいポイントなど
+#
+#   ※ slide は番号（1始まり）またはスライドタイトルの一部でOK
+# ============================================================
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  extract-and-dispatch:
+    if: contains(github.event.issue.labels.*.name, 'slide-discuss')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python環境のセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: python-pptx をインストール
+        run: pip install python-pptx --quiet
+
+      - name: Issueの本文からパラメータを解析
+        id: parse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          ISSUE_BODY=$(gh issue view $ISSUE_NUMBER --json body --jq '.body')
+
+          # "file:" の行を抽出
+          FILE=$(echo "$ISSUE_BODY" | grep -i '^file:' | head -1 | sed 's/^file:\s*//' | tr -d '[:space:]')
+          # "slide:" の行を抽出
+          SLIDE=$(echo "$ISSUE_BODY" | grep -i '^slide:' | head -1 | sed 's/^slide:\s*//')
+          # "comment:" 以降を追加コメントとして抽出
+          COMMENT=$(echo "$ISSUE_BODY" | grep -i '^comment:' | head -1 | sed 's/^comment:\s*//')
+
+          if [ -z "$FILE" ]; then
+            echo "ERROR: 'file:' の指定がありません"
+            gh issue comment $ISSUE_NUMBER --body "❌ エラー: Issue本文に \`file: slides/xxx.pptx\` の記述が見つかりません。"
+            exit 1
+          fi
+
+          if [ -z "$SLIDE" ]; then
+            echo "ERROR: 'slide:' の指定がありません"
+            gh issue comment $ISSUE_NUMBER --body "❌ エラー: Issue本文に \`slide: 番号またはタイトル\` の記述が見つかりません。"
+            exit 1
+          fi
+
+          echo "FILE=$FILE" >> $GITHUB_OUTPUT
+          echo "SLIDE=$SLIDE" >> $GITHUB_OUTPUT
+          echo "COMMENT=$COMMENT" >> $GITHUB_OUTPUT
+
+      - name: PPTXからスライドを抽出
+        id: extract
+        run: |
+          FILE="${{ steps.parse.outputs.FILE }}"
+          SLIDE="${{ steps.parse.outputs.SLIDE }}"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: ファイルが見つかりません: $FILE"
+            gh issue comment ${{ github.event.issue.number }} \
+              --body "❌ エラー: \`$FILE\` がリポジトリに見つかりません。\`slides/\` フォルダにPPTXをpushしてください。"
+            exit 1
+          fi
+
+          # スライドを抽出してstdoutに出力、タイトルはstderrで受け取る
+          python scripts/extract_slide.py "$FILE" "$SLIDE" \
+            > /tmp/slide_content.txt \
+            2> /tmp/slide_meta.txt
+
+          SLIDE_TITLE=$(grep '__SLIDE_TITLE__=' /tmp/slide_meta.txt | sed 's/__SLIDE_TITLE__=//')
+          echo "SLIDE_TITLE=$SLIDE_TITLE" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 議論用Issueを作成して discuss ラベルを付ける
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SLIDE_TITLE="${{ steps.extract.outputs.SLIDE_TITLE }}"
+          COMMENT="${{ steps.parse.outputs.COMMENT }}"
+          ORIGINAL_ISSUE="${{ github.event.issue.number }}"
+
+          # 議論本文を組み立て
+          {
+            cat /tmp/slide_content.txt
+            if [ -n "$COMMENT" ]; then
+              echo ""
+              echo "## 💬 議論してほしいポイント"
+              echo ""
+              echo "$COMMENT"
+            fi
+            echo ""
+            echo "---"
+            echo "_元Issue: #${ORIGINAL_ISSUE}_"
+          } > /tmp/discussion_body.md
+
+          # 新しいIssueを作成（discuss ラベルで ai-discussion.yml を起動）
+          NEW_ISSUE=$(gh issue create \
+            --title "🎯 議論: ${SLIDE_TITLE}" \
+            --body-file /tmp/discussion_body.md \
+            --label "discuss")
+
+          echo "✅ 議論Issueを作成しました: $NEW_ISSUE"
+
+          # 元のIssueに作成したIssueのリンクをコメント
+          gh issue comment $ORIGINAL_ISSUE \
+            --body "$(cat << EOF
+## ✅ スライドの読み取りが完了しました
+
+議論を開始するIssueを作成しました 👇
+$NEW_ISSUE
+
+6つのAIエージェントが議論を開始します。進捗はそちらのIssueで確認できます。
+EOF
+            )"
