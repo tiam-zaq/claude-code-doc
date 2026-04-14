@@ -368,9 +368,8 @@ jobs:
           git push origin "$BRANCH"
 
           REVIEW_BODY=$(cat /tmp/review_output.txt)
-          gh pr create \
-            --title "📄 [AI生成] Issue #${ISSUE_NUMBER} の設計ドキュメント" \
-            --body "$(cat << EOF
+
+          cat > /tmp/pr_body.md << PREOF
 ## 概要
 
 Issue #${ISSUE_NUMBER} のAIマルチエージェント議論から自動生成されました。
@@ -393,7 +392,10 @@ ${REVIEW_BODY}
 ---
 
 Closes #${ISSUE_NUMBER}
-EOF
-            )" \
+PREOF
+
+          gh pr create \
+            --title "📄 [AI生成] Issue #${ISSUE_NUMBER} の設計ドキュメント" \
+            --body-file /tmp/pr_body.md \
             --head "$BRANCH" \
             --base main
