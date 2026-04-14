@@ -1,8 +1,8 @@
 name: Slide to Discussion
 
 # ============================================================
-# slides/ フォルダのPPTXから議論テーマを取り出し、
-# 既存の ai-discussion.yml を呼び出すトリガーIssueを作成する。
+# slides/ フォルダのPPTXからスライドを読み取り、
+# 6つのAIエージェントが議論してドキュメントを生成する統合ワークフロー。
 #
 # 使い方:
 #   1. slides/ フォルダにPPTXを置いてpush
@@ -20,14 +20,21 @@ on:
     types: [labeled]
 
 permissions:
-  contents: read
+  contents: write
   issues: write
+  pull-requests: write
+
+env:
+  ISSUE_NUMBER: ${{ github.event.issue.number }}
+  MODEL: "claude-opus-4-5"
 
 jobs:
-  extract-and-dispatch:
+  # ========== Stage 0: スライド抽出 ==========
+  extract-slide:
     if: contains(github.event.issue.labels.*.name, 'slide-discuss')
     runs-on: ubuntu-latest
-
+    outputs:
+      slide_body: ${{ steps.build.outputs.slide_body_file }}
     steps:
       - uses: actions/checkout@v4
 
@@ -43,26 +50,19 @@ jobs:
         id: parse
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           ISSUE_BODY=$(gh issue view $ISSUE_NUMBER --json body --jq '.body')
 
-          # "file:" の行を抽出
           FILE=$(echo "$ISSUE_BODY" | grep -i '^file:' | head -1 | sed 's/^file:\s*//' | tr -d '[:space:]')
-          # "slide:" の行を抽出
-          SLIDE=$(echo "$ISSUE_BODY" | grep -i '^slide:' | head -1 | sed 's/^slide:\s*//')
-          # "comment:" 以降を追加コメントとして抽出
+          SLIDE=$(echo "$ISSUE_BODY" | grep -i '^slide:' | head -1 | sed 's/^slide:\s*//' | xargs)
           COMMENT=$(echo "$ISSUE_BODY" | grep -i '^comment:' | head -1 | sed 's/^comment:\s*//')
 
           if [ -z "$FILE" ]; then
-            echo "ERROR: 'file:' の指定がありません"
-            gh issue comment $ISSUE_NUMBER --body "❌ エラー: Issue本文に \`file: slides/xxx.pptx\` の記述が見つかりません。"
+            gh issue comment $ISSUE_NUMBER --body "エラー: Issue本文に file: slides/xxx.pptx の記述が見つかりません。"
             exit 1
           fi
-
           if [ -z "$SLIDE" ]; then
-            echo "ERROR: 'slide:' の指定がありません"
-            gh issue comment $ISSUE_NUMBER --body "❌ エラー: Issue本文に \`slide: 番号またはタイトル\` の記述が見つかりません。"
+            gh issue comment $ISSUE_NUMBER --body "エラー: Issue本文に slide: 番号またはタイトル の記述が見つかりません。"
             exit 1
           fi
 
@@ -72,64 +72,404 @@ jobs:
 
       - name: PPTXからスライドを抽出
         id: extract
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           FILE="${{ steps.parse.outputs.FILE }}"
           SLIDE="${{ steps.parse.outputs.SLIDE }}"
 
           if [ ! -f "$FILE" ]; then
-            echo "ERROR: ファイルが見つかりません: $FILE"
-            gh issue comment ${{ github.event.issue.number }} \
-              --body "❌ エラー: \`$FILE\` がリポジトリに見つかりません。\`slides/\` フォルダにPPTXをpushしてください。"
+            gh issue comment $ISSUE_NUMBER \
+              --body "エラー: $FILE がリポジトリに見つかりません。slides/ フォルダにPPTXをpushしてください。"
             exit 1
           fi
 
-          # スライドを抽出してstdoutに出力、タイトルはstderrで受け取る
           python scripts/extract_slide.py "$FILE" "$SLIDE" \
             > /tmp/slide_content.txt \
             2> /tmp/slide_meta.txt
 
-          SLIDE_TITLE=$(grep '__SLIDE_TITLE__=' /tmp/slide_meta.txt | sed 's/__SLIDE_TITLE__=//')
-          echo "SLIDE_TITLE=$SLIDE_TITLE" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 議論用Issueを作成して discuss ラベルを付ける
+      - name: 議論テーマをIssueにコメント
+        id: build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          SLIDE_TITLE="${{ steps.extract.outputs.SLIDE_TITLE }}"
           COMMENT="${{ steps.parse.outputs.COMMENT }}"
-          ORIGINAL_ISSUE="${{ github.event.issue.number }}"
-
-          # 議論本文を組み立て
           {
+            echo "## 📊 スライドから議論を開始します"
+            echo ""
             cat /tmp/slide_content.txt
             if [ -n "$COMMENT" ]; then
               echo ""
-              echo "## 💬 議論してほしいポイント"
+              echo "## 議論してほしいポイント"
               echo ""
               echo "$COMMENT"
             fi
+          } > /tmp/slide_body.md
+          gh issue comment $ISSUE_NUMBER --body-file /tmp/slide_body.md
+
+  # ========== Stage 1: PM担当 ==========
+  pm-agent:
+    needs: extract-slide
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Issueの本文とスライド内容を取得
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue view $ISSUE_NUMBER --json body,comments \
+            --jq '"## 元の要求\n\n" + .body + "\n\n---\n\n## スライド内容\n\n" +
+              ([.comments[] | .body] | join("\n\n---\n\n"))' \
+            > /tmp/context.txt
+
+      - name: PM分析を実行
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SYSTEM=$(cat prompts/pm.md)
+          CONTEXT=$(cat /tmp/context.txt)
+
+          curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM" \
+              --arg context "$CONTEXT" \
+              --arg model "$MODEL" \
+              '{
+                model: $model,
+                max_tokens: 2048,
+                system: $system,
+                messages: [{role: "user", content: $context}]
+              }')" \
+            | jq -r '.content[0].text' > /tmp/pm_output.txt
+
+      - name: Issueにコメント投稿
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 👔 PM担当"
+            echo ""
+            cat /tmp/pm_output.txt
+          } > /tmp/comment.md
+          gh issue comment $ISSUE_NUMBER --body-file /tmp/comment.md
+
+  # ========== Stage 2: ヒアリング担当 ==========
+  hearing-agent:
+    needs: pm-agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: これまでの議論を取得
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue view $ISSUE_NUMBER --json body,comments \
+            --jq '"## 元の要求\n\n" + .body + "\n\n---\n\n## これまでの議論\n\n" +
+              ([.comments[] | "### " + .author.login + "\n\n" + .body] | join("\n\n---\n\n"))' \
+            > /tmp/context.txt
+
+      - name: ヒアリング・要件整理を実行
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SYSTEM=$(cat prompts/hearing.md)
+          CONTEXT=$(cat /tmp/context.txt)
+
+          curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM" \
+              --arg context "$CONTEXT" \
+              --arg model "$MODEL" \
+              '{
+                model: $model,
+                max_tokens: 2048,
+                system: $system,
+                messages: [{role: "user", content: $context}]
+              }')" \
+            | jq -r '.content[0].text' > /tmp/hearing_output.txt
+
+      - name: Issueにコメント投稿
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 🎧 ヒアリング担当"
+            echo ""
+            cat /tmp/hearing_output.txt
+          } > /tmp/comment.md
+          gh issue comment $ISSUE_NUMBER --body-file /tmp/comment.md
+
+  # ========== Stage 3: 段取り担当 ==========
+  planning-agent:
+    needs: hearing-agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: これまでの議論を取得
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue view $ISSUE_NUMBER --json body,comments \
+            --jq '"## 元の要求\n\n" + .body + "\n\n---\n\n## これまでの議論\n\n" +
+              ([.comments[] | "### " + .author.login + "\n\n" + .body] | join("\n\n---\n\n"))' \
+            > /tmp/context.txt
+
+      - name: タスク分解・段取りを実行
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SYSTEM=$(cat prompts/planning.md)
+          CONTEXT=$(cat /tmp/context.txt)
+
+          curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM" \
+              --arg context "$CONTEXT" \
+              --arg model "$MODEL" \
+              '{
+                model: $model,
+                max_tokens: 2048,
+                system: $system,
+                messages: [{role: "user", content: $context}]
+              }')" \
+            | jq -r '.content[0].text' > /tmp/planning_output.txt
+
+      - name: Issueにコメント投稿
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 📋 段取り担当"
+            echo ""
+            cat /tmp/planning_output.txt
+          } > /tmp/comment.md
+          gh issue comment $ISSUE_NUMBER --body-file /tmp/comment.md
+
+  # ========== Stage 4a: 設計/実装担当 ==========
+  design-agent:
+    needs: planning-agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: これまでの議論を取得
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue view $ISSUE_NUMBER --json body,comments \
+            --jq '"## 元の要求\n\n" + .body + "\n\n---\n\n## これまでの議論\n\n" +
+              ([.comments[] | "### " + .author.login + "\n\n" + .body] | join("\n\n---\n\n"))' \
+            > /tmp/context.txt
+
+      - name: 設計ドキュメントを生成
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SYSTEM=$(cat prompts/design.md)
+          CONTEXT=$(cat /tmp/context.txt)
+
+          curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM" \
+              --arg context "$CONTEXT" \
+              --arg model "$MODEL" \
+              '{
+                model: $model,
+                max_tokens: 4096,
+                system: $system,
+                messages: [{role: "user", content: $context}]
+              }')" \
+            | jq -r '.content[0].text' > /tmp/design_output.txt
+
+      - name: ドキュメントをdocs/に保存
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          FILENAME="docs/design_issue${ISSUE_NUMBER}_${TIMESTAMP}.md"
+          {
+            echo "# 議論ドキュメント (Issue #${ISSUE_NUMBER})"
+            echo ""
+            echo "> 生成日時: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo ""
+            cat /tmp/design_output.txt
+          } > "$FILENAME"
+
+      - name: Issueにコメント投稿
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 🏗️ 設計/実装担当"
+            echo ""
+            cat /tmp/design_output.txt
+          } > /tmp/comment.md
+          gh issue comment $ISSUE_NUMBER --body-file /tmp/comment.md
+
+      - name: ドキュメントをアーティファクトに保存
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-doc
+          path: docs/
+
+  # ========== Stage 4b: 見張り番担当 (設計と並列) ==========
+  monitor-agent:
+    needs: planning-agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: これまでの議論を取得
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue view $ISSUE_NUMBER --json body,comments \
+            --jq '"## 元の要求\n\n" + .body + "\n\n---\n\n## これまでの議論\n\n" +
+              ([.comments[] | "### " + .author.login + "\n\n" + .body] | join("\n\n---\n\n"))' \
+            > /tmp/context.txt
+
+      - name: パイプライン監視・品質チェックを実行
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SYSTEM=$(cat prompts/monitor.md)
+          CONTEXT=$(cat /tmp/context.txt)
+
+          curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM" \
+              --arg context "$CONTEXT" \
+              --arg model "$MODEL" \
+              '{
+                model: $model,
+                max_tokens: 2048,
+                system: $system,
+                messages: [{role: "user", content: $context}]
+              }')" \
+            | jq -r '.content[0].text' > /tmp/monitor_output.txt
+
+      - name: Issueにコメント投稿
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## 👁️ 見張り番担当"
+            echo ""
+            cat /tmp/monitor_output.txt
+          } > /tmp/comment.md
+          gh issue comment $ISSUE_NUMBER --body-file /tmp/comment.md
+
+  # ========== Stage 5: レビュー担当 & PR作成 ==========
+  review-agent:
+    needs: [design-agent, monitor-agent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 設計ドキュメントをダウンロード
+        uses: actions/download-artifact@v4
+        with:
+          name: design-doc
+          path: docs/
+
+      - name: 全議論のコンテキストを取得
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue view $ISSUE_NUMBER --json body,comments \
+            --jq '"## 元の要求\n\n" + .body + "\n\n---\n\n## 全エージェントの議論\n\n" +
+              ([.comments[] | "### " + .author.login + "\n\n" + .body] | join("\n\n---\n\n"))' \
+            > /tmp/context.txt
+
+      - name: 最終レビューを実行
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SYSTEM=$(cat prompts/review.md)
+          CONTEXT=$(cat /tmp/context.txt)
+
+          curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM" \
+              --arg context "$CONTEXT" \
+              --arg model "$MODEL" \
+              '{
+                model: $model,
+                max_tokens: 2048,
+                system: $system,
+                messages: [{role: "user", content: $context}]
+              }')" \
+            | jq -r '.content[0].text' > /tmp/review_output.txt
+
+      - name: レビューコメントを投稿
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## ✅ レビュー担当（最終確認）"
+            echo ""
+            cat /tmp/review_output.txt
+          } > /tmp/comment.md
+          gh issue comment $ISSUE_NUMBER --body-file /tmp/comment.md
+
+      - name: PR本文を生成
+        run: |
+          REVIEW_BODY=$(cat /tmp/review_output.txt)
+          {
+            echo "## 概要"
+            echo ""
+            echo "Issue #${ISSUE_NUMBER} のスライドからAIマルチエージェント議論で自動生成されました。"
+            echo ""
+            echo "## エージェント構成"
+            echo ""
+            echo "- PM担当: 議論テーマの定義"
+            echo "- ヒアリング担当: 論点の整理"
+            echo "- 段取り担当: 議論の進行設計"
+            echo "- 設計/実装担当: 議論の展開"
+            echo "- 見張り番担当: 品質監視"
+            echo "- レビュー担当: 最終確認"
+            echo ""
+            echo "## レビュー担当の最終判定"
+            echo ""
+            echo "$REVIEW_BODY"
             echo ""
             echo "---"
-            echo "_元Issue: #${ORIGINAL_ISSUE}_"
-          } > /tmp/discussion_body.md
-
-          # 新しいIssueを作成（discuss ラベルで ai-discussion.yml を起動）
-          NEW_ISSUE=$(gh issue create \
-            --title "🎯 議論: ${SLIDE_TITLE}" \
-            --body-file /tmp/discussion_body.md \
-            --label "discuss")
-
-          echo "✅ 議論Issueを作成しました: $NEW_ISSUE"
-
-          # 元のIssueに作成したIssueのリンクをコメント
-          {
-            echo "## スライドの読み取りが完了しました"
             echo ""
-            echo "議論を開始するIssueを作成しました"
-            echo "$NEW_ISSUE"
-            echo ""
-            echo "6つのAIエージェントが議論を開始します。進捗はそちらのIssueで確認できます。"
-          } > /tmp/notify_body.md
-          gh issue comment $ORIGINAL_ISSUE --body-file /tmp/notify_body.md
+            echo "Closes #${ISSUE_NUMBER}"
+          } > /tmp/pr_body.md
+
+      - name: PRを作成
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="ai-doc/issue-${ISSUE_NUMBER}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add docs/
+          git commit -m "docs: Issue #${ISSUE_NUMBER} のスライド議論からドキュメント生成"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "[AI生成] Issue #${ISSUE_NUMBER} の議論ドキュメント" \
+            --body-file /tmp/pr_body.md \
+            --head "$BRANCH" \
+            --base main
